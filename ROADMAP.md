@@ -72,10 +72,6 @@ The miviex kernel phases each of these waits for are in miviex's
 
 - Read `/proc/cmdline` for `emergency` and `simpled.unit=`: the miviex
   kernel does not pass its arguments to init.
-- Freeze in `sigsuspend` instead of `pause`, which miviex lacks (musl's
-  `pause` then fails at once, and the freeze loop spins).
-- Once miviex fixes them, drop the workarounds for `ppoll`'s mask and
-  for init holding the console as its controlling terminal.
 
 ## Phase 5: logging, with miviex phase 8
 
@@ -93,8 +89,7 @@ and a service that floods its output cannot stall PID 1.
 ## Phase 6: disks, with miviex phase 9
 
 - A disk root; `fsck` and remount read-write as units; the root
-  remounted read-only at shutdown (needs `umount2` flags, miviex
-  phase 6); logs that survive a reboot.
+  remounted read-only at shutdown; logs that survive a reboot.
 - wtmp and lastlog written at login, so last and lastlog have data.
 
 ## Phase 7: sockets, with miviex phase 12
