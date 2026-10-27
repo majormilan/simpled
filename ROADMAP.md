@@ -65,12 +65,24 @@ Linux before miviex can run it). `make check` runs the Linux side.
   tty1 and ttyS0 and `fstab.service` are units. Checked in QEMU: boot in
   order, a killed getty comes back, `restart`, `poweroff` powers off.
 
-## Phase 5: logging
+The miviex kernel phases each of these waits for are in miviex's
+`ROADMAP.md` (init track).
+
+## Phase 4b: small things, with miviex phase 6
+
+- Read `/proc/cmdline` for `emergency` and `simpled.unit=`: the miviex
+  kernel does not pass its arguments to init.
+- Freeze in `sigsuspend` instead of `pause`, which miviex lacks (musl's
+  `pause` then fails at once, and the freeze loop spins).
+- Once miviex fixes them, drop the workarounds for `ppoll`'s mask and
+  for init holding the console as its controlling terminal.
+
+## Phase 5: logging, with miviex phase 8
 
 - Each service's stdout and stderr go to a pipe read by PID 1 and
   written with timestamps to `/var/log/simpled/<unit>.log`, one
   rotation at a size limit. Today the service writes the file itself:
-  no timestamps, no limit. Needs non-blocking pipes on miviex.
+  no timestamps, no limit. Needs `O_NONBLOCK` on pipes (miviex phase 8).
 - Lines from before `/var/log` is writable stay in a memory buffer and
   are flushed later; simpled's own messages go there too.
 - `simplectl log <unit>` (with `-f`).
@@ -78,31 +90,21 @@ Linux before miviex can run it). `make check` runs the Linux side.
 Done when every boot message and service line is in a file after boot,
 and a service that floods its output cannot stall PID 1.
 
-## Phase 6: once miviex has disks and sockets
+## Phase 6: disks, with miviex phase 9
 
-- miviex phase 6: a disk root, `fsck` and remount read-write as units,
-  logs that survive a reboot.
-- miviex phase 9: `simplectl` over `/run/simpled.sock`; `Type=notify`
-  (the `READY=1` subset of `sd_notify`).
+- A disk root; `fsck` and remount read-write as units; the root
+  remounted read-only at shutdown (needs `umount2` flags, miviex
+  phase 6); logs that survive a reboot.
+- wtmp and lastlog written at login, so last and lastlog have data.
+
+## Phase 7: sockets, with miviex phase 12
+
+- `simplectl` over `/run/simpled.sock`; `Type=notify` (the `READY=1`
+  subset of `sd_notify`).
+- The log collector listens on `/dev/log`, for logger and cron.
 - Optional, only when something needs it: `ExecStartPost=`,
   `BindsTo=`, rlimits (`LimitNOFILE=`), `Type=forking` with `PIDFile=`,
   simple `.timer` units.
-
-## Needed from the miviex kernel
-
-Found while bringing simpled up; simpled works around all of them.
-
-- `ppoll` should apply its signal mask atomically.
-- Pipes should honour `O_NONBLOCK` (phase 5 needs it).
-- init should not get the console as its controlling terminal, as on
-  Linux (or `TIOCNOTTY` should exist): until a getty takes the console,
-  `^C` typed there reaches PID 1 as SIGINT, which means reboot.
-
-Also seen, outside simpled, in shush (on Linux too unless noted): `$?`
-after `;` on the same line is always 0; `$(...)` inside double quotes is
-a syntax error; `x=$(...)` is not an assignment (on miviex, with a pipe
-inside, a page fault at 0); `if` is not a keyword. And on miviex the
-serial console drops the first characters of lines typed into shush.
 
 ## Not planned
 
