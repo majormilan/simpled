@@ -35,7 +35,10 @@ group. Output goes to /var/log/simpled/<unit>.log ("journal").
 Control
 -------
 miviex has no Unix sockets yet: simplectl writes a request file to
-/run/simpled/req and sends SIGUSR1. Only root can do that.
+/run/simpled/req and sends SIGUSR1, which only root can do. start, stop
+and restart wait for their jobs and report failures (--no-block does
+not wait). simpled keeps each unit's state in /run/simpled/units/<unit>,
+so status, is-active and list work for every user without a request.
 
 Signals to simpled: SIGTERM, SIGINT (Ctrl+Alt+Del) reboot, SIGUSR2
 powers off, SIGHUP rereads unit files.

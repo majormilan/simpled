@@ -160,6 +160,12 @@ Description=Instance %i
 ExecStart=/bin/sh -c 'echo %i %n %p > $T/inst; exec sleep 1001'
 EOF
 
+unit slow.service <<EOF
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sleep 1; touch $T/slow.\$\$'
+EOF
+
 L=$R/usr/local/lib/simpled/system
 mkdir -p "$L"
 cat > "$L/late.service" <<EOF
@@ -206,8 +212,8 @@ check "a unit ignoring SIGTERM is killed after TimeoutStopSec" waitfor active st
 check "  ... and it says so" grep -q "stubborn.service: stop timed out" "$T/log"
 
 ctl stop app
-check "stop runs ExecStop with \$MAINPID" waitfor test -s "$T/app.stop"
-check "  ... and the unit is inactive" waitfor active app.service inactive
+check "stop waits: the unit is inactive when it returns" active app.service inactive
+check "  ... and ExecStop ran with \$MAINPID" test -s "$T/app.stop"
 ctl start app
 check "start brings it back" waitfor active app.service
 oldpid=$(sed -n 's/.*Main PID: //p' "$T/status")
@@ -215,6 +221,39 @@ ctl restart app
 check "restart gives a new main process" \
 	waitfor sh -c "'$top/simplectl' -r '$R' status app | grep -q 'Main PID:' &&
 	! '$top/simplectl' -r '$R' status app | grep -q 'Main PID: $oldpid\$'"
+
+out=$(ctl start broken 2>&1)
+check "a failed start returns 1" test $? -eq 1
+check "  ... and says why" test "$out" = "Job for broken.service failed (exit-code).
+See 'simplectl status broken.service'."
+ctl start slow
+check "start waits for a oneshot to finish" sh -c "ls '$T' | grep -q '^slow\.'"
+rm -f "$T"/slow.*
+ctl --no-block start slow
+check "--no-block does not" sh -c "! ls '$T' | grep -q '^slow\.'"
+waitfor sh -c "ls '$T' | grep -q '^slow\.'"
+"$top/simplectl" -r "$R" start slow & cpid=$!
+sleep 0.3
+kill -INT $cpid
+wait $cpid
+check "^C while waiting: exit 130" test $? -eq 130
+waitfor active slow.service inactive
+sleep 1.2
+check "  ... and no request files are left" test -z "$(ls "$R/run/simpled/req")"
+
+ctl status nosuch >/dev/null 2>&1
+check "status of a unit that does not exist returns 4" test $? -eq 4
+ctl status late > "$T/late.status"
+check "status of a unit simpled never loaded returns 3" test $? -eq 3
+check "  ... and comes from its file" grep -q "Loaded: loaded (/usr/local/lib/simpled/system/late.service)" "$T/late.status"
+check "list is sorted and comes from the state files" \
+	sh -c "'$top/simplectl' -r '$R' list | sed 1d | cut -d' ' -f1 | sort -c"
+
+check "get-default follows the alias" test "$(ctl get-default)" = test.target
+ctl set-default multi-user >/dev/null
+check "set-default relinks default.target" test "$(ctl get-default)" = multi-user.target
+ctl set-default test.target >/dev/null
+check "cat shows the file with its path" sh -c "'$top/simplectl' -r '$R' cat late | head -1 | grep -qx '# /usr/local/lib/simpled/system/late.service'"
 
 check "enable links into WantedBy= targets" sh -c "'$top/simplectl' -r '$R' enable late >/dev/null"
 check "  ... is-enabled says enabled" test "$(ctl is-enabled late)" = enabled

@@ -44,6 +44,7 @@ struct Unit {
 	int busy;               /* the job has begun */
 	int again;              /* start once the stop job is through */
 	int killed;             /* SIGKILL sent */
+	int canceled;           /* a stop replaced the start job */
 	size_t cmd;             /* next command of the phase */
 	pid_t main, ctl;        /* each leads its own session and group */
 	int status;             /* last wait status */
@@ -51,6 +52,7 @@ struct Unit {
 	long long since, timer, window;
 	int starts;
 	unsigned mark;
+	char *pub;              /* what RUNDIR/units/<name> says */
 	Unit *next;
 };
 
@@ -76,7 +78,21 @@ static const struct {
 	{ "tmpfs", "/run",  "tmpfs", "mode=0755" },
 };
 
+/* A request that waits for the jobs of its units */
+typedef struct Req Req;
+struct Req {
+	int fd;
+	char *path;             /* <name>.wait, renamed to <name>.done */
+	Buf out;
+	int code;
+	int stop;               /* reports the stop jobs, not the starts */
+	Unit **wait;
+	size_t n;
+	Req *next;
+};
+
 static Unit *units;
+static Req *reqs;
 static unsigned gen;            /* marks visited units in start and stop */
 static int pid1;
 static int halting;             /* the reboot(2) command once shutting down */
@@ -493,6 +509,7 @@ beginstart(Unit *u)
 {
 	u->timer = 0;
 	u->result = NULL;
+	u->canceled = 0;
 	if (u->load != LOAD_OK) {
 		fail(u, loadname[u->load]);
 		return;
@@ -759,6 +776,7 @@ stop(Unit *u)
 	if (u->job == JOB_START) {
 		u->job = JOB_NONE;
 		u->busy = 0;
+		u->canceled = 1;
 	}
 	if (u->job == JOB_NONE && (u->main || u->ctl || u->phase == PH_WAIT ||
 	    (u->state != INACTIVE && u->state != FAILED)))
@@ -816,21 +834,6 @@ nexttimer(void)
 	return next;
 }
 
-static void
-fmtdur(Buf *b, long long ms)
-{
-	long long s = ms / 1000;
-
-	if (s >= 3600)
-		bufprintf(b, "%lldh %lldmin", s / 3600, s / 60 % 60);
-	else if (s >= 60)
-		bufprintf(b, "%lldmin %llds", s / 60, s % 60);
-	else if (s)
-		bufprintf(b, "%llds", s);
-	else
-		bufprintf(b, "%lldms", ms);
-}
-
 static const char *
 sub(Unit *u)
 {
@@ -841,31 +844,35 @@ sub(Unit *u)
 	return phasename[u->phase];
 }
 
+/* Writes RUNDIR/units/<name> when what it says changes: simplectl reads
+ * status, is-active and list from there, for anyone, with no request. */
 static void
-status(Buf *b, Unit *u)
+publish(Unit *u)
 {
-	bufprintf(b, "* %s - %s\n", u->name, desc(u));
-	bufprintf(b, "    Loaded: %s", loadname[u->load]);
-	if (u->path)
-		bufprintf(b, " (%s)", u->path + strlen(root));
-	bufprintf(b, "\n    Active: %s (%s)", statename[u->state], sub(u));
-	if (u->since) {
-		bufprintf(b, " for ");
-		fmtdur(b, now() - u->since);
+	char path[PATH_MAX + NAME_MAX + 2], tmp[PATH_MAX + NAME_MAX + 8];
+	Buf b = { 0 };
+	FILE *fp;
+
+	bufprintf(&b, "load=%s\nstate=%s\nsub=%s\nsince=%lld\n", loadname[u->load],
+	          statename[u->state], sub(u), u->since);
+	bufprintf(&b, "path=%s\ndesc=%s\n", u->path ? u->path + strlen(root) : "",
+	          u->c.desc ? u->c.desc : "");
+	bufprintf(&b, "main=%d\nctl=%d\nresult=%s\nstatus=%d\njob=%s\n", (int)u->main,
+	          (int)u->ctl, u->result ? u->result : "", u->status,
+	          u->job == JOB_START ? "start" : u->job == JOB_STOP ? "stop" : "");
+	if (u->pub && !strcmp(u->pub, b.s)) {
+		free(b.s);
+		return;
 	}
-	bufprintf(b, "\n");
-	if (u->job != JOB_NONE)
-		bufprintf(b, "       Job: %s\n", u->job == JOB_START ? "start" : "stop");
-	if (u->main)
-		bufprintf(b, "  Main PID: %d\n", (int)u->main);
-	if (u->ctl)
-		bufprintf(b, "   Control: %d\n", (int)u->ctl);
-	if (u->result)
-		bufprintf(b, "    Result: %s\n", u->result);
-	if (u->status && WIFEXITED(u->status))
-		bufprintf(b, " Last exit: status %d\n", WEXITSTATUS(u->status));
-	else if (u->status)
-		bufprintf(b, " Last exit: signal %d\n", WTERMSIG(u->status));
+	snprintf(path, sizeof(path), "%s%s/units/%s", root, RUNDIR, u->name);
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	if (!(fp = fopen(tmp, "we")) || fputs(b.s, fp) < 0 || fclose(fp) < 0 || rename(tmp, path) < 0) {
+		warn("%s:", tmp);
+		free(b.s);
+		return;
+	}
+	free(u->pub);
+	u->pub = b.s;
 }
 
 static void
@@ -893,67 +900,128 @@ reload(void)
 		unitload(u);
 }
 
-/* One request: "command [unit...]". The reply starts with the exit code
- * simplectl returns, the rest is printed. */
+static int
+pending(Unit *u)
+{
+	return u->job != JOB_NONE || u->again;
+}
+
+/* why the last start of u did not bring it up, NULL if it did */
+static const char *
+startresult(Unit *u)
+{
+	if (u->canceled)
+		return "canceled";
+	if (u->state == FAILED)
+		return u->result ? u->result : "failed";
+	if (u->state == ACTIVE || u->state == ACTIVATING)
+		return NULL;
+	if (u->kind == UNIT_SERVICE && u->c.type == ONESHOT && u->state == INACTIVE)
+		return NULL;
+	return "canceled";
+}
+
 static void
-command(char *req, Buf *out)
+reply(Req *r)
+{
+	char done[PATH_MAX + NAME_MAX + 8];
+	const char *why;
+	size_t i;
+
+	for (i = 0; i < r->n; i++) {
+		if (r->stop || !(why = startresult(r->wait[i])))
+			continue;
+		bufprintf(&r->out, "Job for %s failed (%s).\nSee 'simplectl status %s'.\n",
+		          r->wait[i]->name, why, r->wait[i]->name);
+		r->code = 1;
+	}
+	snprintf(r->out.s, 4, "%-3d", r->code);
+	r->out.s[3] = '\n';
+	if (ftruncate(r->fd, 0) < 0 || pwrite(r->fd, r->out.s, r->out.n, 0) != (ssize_t)r->out.n)
+		warn("%s:", r->path);
+	close(r->fd);
+	/* the name ends in .wait: swap it for .done */
+	snprintf(done, sizeof(done), "%.*s.done", (int)(strlen(r->path) - 5), r->path);
+	rename(r->path, done);
+	free(r->path);
+	free(r->out.s);
+	free(r->wait);
+	free(r);
+}
+
+/* Answers the requests whose jobs are all through. */
+static void
+answer(void)
+{
+	Req **p = &reqs, *r;
+	size_t i;
+
+	while ((r = *p)) {
+		for (i = 0; i < r->n && !pending(r->wait[i]); i++)
+			;
+		if (i < r->n) {
+			p = &r->next;
+			continue;
+		}
+		*p = r->next;
+		reply(r);
+	}
+}
+
+/* One request: "command [--no-block] [unit...]". The reply starts with
+ * the exit code simplectl returns, the rest is printed. start, stop and
+ * restart wait for their jobs, unless --no-block. */
+static void
+command(char *req, Req *r)
 {
 	List w = { 0 };
 	Unit *u;
-	size_t i;
-	int code = 0;
+	size_t i, j;
+	int block = 1;
 	char *cmd;
 
+	bufprintf(&r->out, "%-3d\n", 0);
 	if (splitwords(req, &w) < 0 || !w.n) {
-		bufprintf(out, "1\nbad request\n");
+		bufprintf(&r->out, "bad request\n");
+		r->code = 1;
 		goto end;
 	}
 	cmd = w.v[0];
-	if (!strcmp(cmd, "list")) {
-		bufprintf(out, "0\n%-32s %-9s %-12s %-12s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION");
-		for (u = units; u; u = u->next)
-			if (u->load == LOAD_OK || u->state != INACTIVE)
-				bufprintf(out, "%-32s %-9s %-12s %-12s %s\n", u->name,
-				          loadname[u->load], statename[u->state], sub(u), desc(u));
-		goto end;
-	}
 	if (!strcmp(cmd, "daemon-reload")) {
 		reload();
-		bufprintf(out, "0\n");
 		goto end;
 	}
 	if (!strcmp(cmd, "poweroff") || !strcmp(cmd, "reboot") || !strcmp(cmd, "halt")) {
 		halt(*cmd == 'p' ? RB_POWER_OFF : *cmd == 'r' ? RB_AUTOBOOT : RB_HALT_SYSTEM);
-		bufprintf(out, "0\n");
 		goto end;
 	}
 
 	/* the rest act on units: the reply's code is the worst of them */
-	bufprintf(out, "%-3d\n", 0);
+	r->stop = !strcmp(cmd, "stop");
 	for (i = 1; i < w.n; i++) {
-		gen++;
-		if (unittemplate(w.v[i], NULL, 0) < 0 || !(u = unitget(w.v[i]))) {
-			bufprintf(out, "%s: not a unit name\n", w.v[i]);
-			code = code < 1 ? 1 : code;
+		if (!strcmp(w.v[i], "--no-block")) {
+			block = 0;
 			continue;
 		}
-		if (!strcmp(cmd, "status")) {
-			status(out, u);
-			if (u->state != ACTIVE)
-				code = u->load == LOAD_NOTFOUND ? 4 : code < 3 ? 3 : code;
-		} else if (!strcmp(cmd, "is-active")) {
-			bufprintf(out, "%s\n", statename[u->state]);
-			if (u->state != ACTIVE)
-				code = code < 3 ? 3 : code;
-		} else if (!strcmp(cmd, "reset-failed")) {
+		gen++;
+		if (unittemplate(w.v[i], NULL, 0) < 0 || !(u = unitget(w.v[i]))) {
+			bufprintf(&r->out, "%s: not a unit name\n", w.v[i]);
+			r->code = r->code < 1 ? 1 : r->code;
+			continue;
+		}
+		if (!strcmp(cmd, "reset-failed")) {
 			if (u->state == FAILED)
 				enter(u, INACTIVE);
 			u->result = NULL;
 			u->starts = 0;
-		} else if (u->load != LOAD_OK && strcmp(cmd, "stop")) {
-			bufprintf(out, "%s: %s\n", u->name, loadname[u->load]);
-			code = 5;
-		} else if (!strcmp(cmd, "start")) {
+			continue;
+		}
+		if (u->load != LOAD_OK && strcmp(cmd, "stop")) {
+			bufprintf(&r->out, "%s: %s\n", u->name, loadname[u->load]);
+			r->code = 5;
+			continue;
+		}
+		if (!strcmp(cmd, "start")) {
 			start(u);
 		} else if (!strcmp(cmd, "stop")) {
 			stop(u);
@@ -967,36 +1035,44 @@ command(char *req, Buf *out)
 			}
 		} else if (!strcmp(cmd, "reload")) {
 			if (!u->c.reload.n || u->state != ACTIVE || u->ctl) {
-				bufprintf(out, "%s: cannot reload now\n", u->name);
-				code = 1;
+				bufprintf(&r->out, "%s: cannot reload now\n", u->name);
+				r->code = 1;
 			} else {
 				u->phase = PH_RELOAD;
 				u->cmd = 0;
 				advance(u);
 			}
+			continue;
 		} else {
-			bufprintf(out, "%s: unknown command\n", cmd);
-			code = 1;
+			bufprintf(&r->out, "%s: unknown command\n", cmd);
+			r->code = 1;
 			break;
 		}
+		for (j = 0; j < r->n && r->wait[j] != u; j++)
+			;
+		if (j == r->n) {
+			r->wait = erealloc(r->wait, (r->n + 1) * sizeof(*r->wait));
+			r->wait[r->n++] = u;
+		}
 	}
-	snprintf(out->s, 4, "%-3d", code);
-	out->s[3] = '\n';
+	if (!block)
+		r->n = 0;
 end:
 	lfree(&w);
 }
 
-/* Requests are files in RUNDIR/req, only root can write there. Each is
- * answered in place and renamed to <name>.done for simplectl to read. */
+/* Requests are files in RUNDIR/req, which only root can write to. A
+ * request taken is renamed to <name>.wait, and to <name>.done once
+ * answered in place. */
 static void
 requests(void)
 {
-	char dir[PATH_MAX], path[PATH_MAX + NAME_MAX + 2], done[PATH_MAX + NAME_MAX + 8], req[4096];
+	char dir[PATH_MAX], path[PATH_MAX + NAME_MAX + 2], wait[PATH_MAX + NAME_MAX + 8], req[4096];
 	struct dirent *e;
 	struct stat st;
-	Buf out = { 0 };
 	ssize_t n;
 	DIR *d;
+	Req *r;
 	int fd;
 
 	snprintf(dir, sizeof(dir), "%s%s/req", root, RUNDIR);
@@ -1006,25 +1082,26 @@ requests(void)
 		if (strchr(e->d_name, '.'))
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-		snprintf(done, sizeof(done), "%s.done", path);
-		if ((fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)) < 0)
+		snprintf(wait, sizeof(wait), "%s.wait", path);
+		if ((fd = open(path, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)) < 0) {
+			unlink(path);
 			continue;
+		}
 		if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
-		    (n = read(fd, req, sizeof(req) - 1)) < 0) {
+		    (n = read(fd, req, sizeof(req) - 1)) < 0 || rename(path, wait) < 0) {
 			close(fd);
 			unlink(path);
 			continue;
 		}
 		req[n] = '\0';
-		bufreset(&out);
-		command(req, &out);
-		if (ftruncate(fd, 0) < 0 || pwrite(fd, out.s, out.n, 0) != (ssize_t)out.n)
-			warn("%s:", path);
-		close(fd);
-		rename(path, done);
+		r = ecalloc(1, sizeof(*r));
+		r->fd = fd;
+		r->path = estrdup(wait);
+		command(req, r);
+		r->next = reqs;
+		reqs = r;
 	}
 	closedir(d);
-	free(out.s);
 }
 
 static void
@@ -1166,6 +1243,7 @@ main(int argc, char *argv[])
 	mkdir(rpath(path, sizeof(path), RUNDIR), 0755);
 	mkdir(rpath(path, sizeof(path), RUNDIR "/req"), 0700);
 	chmod(path, 0700);
+	mkdir(rpath(path, sizeof(path), RUNDIR "/units"), 0755);
 	if ((fp = fopen(rpath(path, sizeof(path), RUNDIR "/pid"), "we"))) {
 		fprintf(fp, "%d\n", (int)getpid());
 		fclose(fp);
@@ -1207,6 +1285,10 @@ main(int argc, char *argv[])
 		}
 		firetimers();
 		dispatch();
+		/* the state first: what a reply says must already be readable */
+		for (u = units; u; u = u->next)
+			publish(u);
+		answer();
 		if (halting) {
 			for (u = units; u && u->job == JOB_NONE; u = u->next)
 				;

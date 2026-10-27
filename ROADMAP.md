@@ -51,24 +51,19 @@ Linux before miviex can run it). `make check` runs the Linux side.
   unit stops what requires it; shutdown: all units, `kill(-1)` TERM
   then KILL, unmount, read-only `/`, `reboot(2)`. SIGINT (Ctrl+Alt+Del)
   and SIGTERM reboot, SIGUSR2 powers off, SIGHUP reloads.
-- Phase 4, most of it: `simplectl` over request files in
-  `/run/simpled/req` and `SIGUSR1`; `start stop restart reload status
-  is-active reset-failed list daemon-reload poweroff reboot halt`,
-  `enable disable is-enabled mask unmask`; systemctl's exit codes;
-  `poweroff`/`reboot`/`halt` links, `-f` to skip the units.
+- Phase 4: `simplectl` over request files in `/run/simpled/req` and
+  `SIGUSR1` (root only: users may not signal PID 1); `start`, `stop`
+  and `restart` wait for their jobs and say why one failed, unless
+  `--no-block`, and `^C` leaves nothing behind. Each unit's state is in
+  `/run/simpled/units/<unit>`, rewritten when it changes, so `status`,
+  `is-active` and `list` work for every user. `reload reset-failed
+  daemon-reload poweroff reboot halt`; `enable disable is-enabled mask
+  unmask cat get-default set-default` on the files alone; systemctl's
+  exit codes; `poweroff`/`reboot`/`halt` links, `-f` to skip the units.
+  Checked on miviex, as root and as the user miviex.
 - In miviex: `/init` is simpled, built from `ext/simpled`; gettys on
   tty1 and ttyS0 and `fstab.service` are units. Checked in QEMU: boot in
   order, a killed getty comes back, `restart`, `poweroff` powers off.
-
-## Phase 4: the rest of simplectl
-
-- `start`/`stop`/`restart` wait for their job and report its result
-  (today they return once the job is queued, like `--no-block`).
-- `status` for users other than root: needs the socket (phase 6), or
-  state files in `/run/simpled` readable by all.
-- `set-default`, `cat`.
-
-Done when `simplectl start broken.service` returns non-zero and says why.
 
 ## Phase 5: logging
 
@@ -103,9 +98,11 @@ Found while bringing simpled up; simpled works around all of them.
   Linux (or `TIOCNOTTY` should exist): until a getty takes the console,
   `^C` typed there reaches PID 1 as SIGINT, which means reboot.
 
-Also seen, outside simpled: shush crashes (page fault at 0) on a command
-substitution holding a pipe, `x=$(a | b)`; and the serial console drops
-the first characters of input lines typed into shush.
+Also seen, outside simpled, in shush (on Linux too unless noted): `$?`
+after `;` on the same line is always 0; `$(...)` inside double quotes is
+a syntax error; `x=$(...)` is not an assignment (on miviex, with a pipe
+inside, a page fault at 0); `if` is not a keyword. And on miviex the
+serial console drops the first characters of lines typed into shush.
 
 ## Not planned
 
