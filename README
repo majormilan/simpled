@@ -1,0 +1,52 @@
+simpled - a simple init that reads systemd units
+================================================
+simpled is PID 1 for miviex. It reads a subset of systemd's unit files
+and does what matters of systemd's work: targets, dependencies and
+ordering, restarts, clean stops with timeouts, and the shutdown. It is
+a single-threaded loop of a few hundred lines more than it has features.
+
+simplectl starts, stops and inspects units, enables and masks them, and
+is poweroff, reboot and halt when called by those names.
+
+
+Units
+-----
+Units are searched in /etc/simpled/system, then PREFIX/lib/simpled/system.
+Services and targets are supported, templates (getty@.service started as
+getty@tty1.service) and aliases (default.target -> multi-user.target).
+
+[Unit]     Description Wants Requires After Before Conflicts
+           StartLimitBurst StartLimitIntervalSec
+[Service]  Type=simple|oneshot RemainAfterExit ExecStartPre ExecStart
+           ExecStop ExecReload Restart=no|on-failure|always RestartSec
+           TimeoutStopSec KillSignal User Group WorkingDirectory UMask
+           Environment EnvironmentFile StandardInput=null|tty
+           StandardOutput StandardError=journal|console|tty|null|inherit
+           TTYPath
+[Install]  WantedBy
+
+Specifiers: %n %N %p %i %I %%. A '-' before a command ignores its exit
+status. Unknown keys are reported with file and line, and skipped.
+
+Each service runs in its own session; stopping it signals its process
+group. Output goes to /var/log/simpled/<unit>.log ("journal").
+
+
+Control
+-------
+miviex has no Unix sockets yet: simplectl writes a request file to
+/run/simpled/req and sends SIGUSR1. Only root can do that.
+
+Signals to simpled: SIGTERM, SIGINT (Ctrl+Alt+Del) reboot, SIGUSR2
+powers off, SIGHUP rereads unit files.
+
+
+Building
+--------
+Edit config.mk and config.h (copied from config.def.h), then:
+
+	make
+	make check     # runs simpled unprivileged, and as PID 1 in a namespace
+	make install
+
+For miviex: make CC=musl-gcc LDFLAGS="-static -s"
