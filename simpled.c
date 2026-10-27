@@ -176,7 +176,8 @@ unitget(const char *name)
 	return *p = u;
 }
 
-/* Environment for the child: PATH, the user's, then the unit's. */
+/* Environment for the child: PATH, the user's (the one it runs as, root
+ * without User=), then the unit's. */
 static int
 setupenv(Unit *u, struct passwd *pw)
 {
@@ -188,7 +189,7 @@ setupenv(Unit *u, struct passwd *pw)
 
 	clearenv();
 	setenv("PATH", DEFPATH, 1);
-	if (pw) {
+	if (pw || (pw = getpwuid(getuid()))) {
 		setenv("HOME", pw->pw_dir, 1);
 		setenv("USER", pw->pw_name, 1);
 		setenv("LOGNAME", pw->pw_name, 1);
@@ -632,14 +633,16 @@ reap(void)
 	}
 }
 
-/* a must start before b, and b stop before a */
+/* a must start before b, and b stop before a. A target comes after
+ * what it pulls in, unless that is ordered after the target itself. */
 static int
 before(Unit *a, Unit *b)
 {
 	return lhas(&b->c.dep[DEP_AFTER], a->name) ||
 	       lhas(&a->c.dep[DEP_BEFORE], b->name) ||
-	       (b->kind == UNIT_TARGET && (lhas(&b->c.dep[DEP_WANTS], a->name) ||
-	                                   lhas(&b->c.dep[DEP_REQUIRES], a->name)));
+	       (b->kind == UNIT_TARGET && !lhas(&a->c.dep[DEP_AFTER], b->name) &&
+	        !lhas(&b->c.dep[DEP_BEFORE], a->name) &&
+	        (lhas(&b->c.dep[DEP_WANTS], a->name) || lhas(&b->c.dep[DEP_REQUIRES], a->name)));
 }
 
 /* the unit whose job u's job waits for, or NULL */

@@ -133,6 +133,16 @@ ExecStart=/bin/sh -c 'trap "" TERM; while :; do sleep 0.1; done'
 TimeoutStopSec=500ms
 EOF
 
+# ordered after the target that wants it: no cycle
+unit after-target.service <<EOF
+[Unit]
+After=test.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "\$HOME" > $T/after-target'
+EOF
+ln -s ../after-target.service "$U/test.target.wants/after-target.service"
+
 unit env.service <<EOF
 [Service]
 Type=oneshot
@@ -180,6 +190,10 @@ check "an ordering cycle is reported precisely" \
 check "  ... and broken" waitfor active cyc-a.service
 check "  ... both ways" waitfor active cyc-b.service
 check "unknown keys are reported with file:line" grep -q "app.service:10: unknown key Bogus" "$T/log"
+
+check "a unit After= the target that wants it starts after it, with \$HOME" \
+	waitfor test -s "$T/after-target"
+check "  ... and that is no cycle" sh -c "! grep -q 'cycle: .*after-target' '$T/log'"
 
 check "status of a running unit returns 0" sh -c "'$top/simplectl' -r '$R' status app >/dev/null"
 ctl status app > "$T/status"

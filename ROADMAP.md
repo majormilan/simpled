@@ -8,129 +8,76 @@ suckless standard, in a few thousand lines of C at most, static and
 linked against musl.
 
 Each phase ends with a check that can be run on miviex itself (or on
-Linux before miviex can run it).
+Linux before miviex can run it). `make check` runs the Linux side.
 
 ## Design rules
 
-- Single thread, one event loop. Signal handlers write one byte to a
-  self-pipe; the loop `ppoll`s on it. miviex has `pipe2`, `ppoll` and
-  `rt_sigprocmask`, but no `signalfd`, `epoll` or `timerfd`, so timeouts
-  come from the `ppoll` timeout.
-- PID 1 never exits and never calls `die()` after boot. On a fatal error
-  it starts an emergency shell on the console.
+- Single thread, one event loop. Signal handlers set a flag and write
+  one byte to a self-pipe, only if none is pending: miviex pipes ignore
+  `O_NONBLOCK` and its `ppoll` ignores the signal mask, so the handler
+  must never be able to fill the pipe. Timeouts come from `poll`.
+- PID 1 never exits; `die()` freezes it instead of panicking the kernel.
 - Every service runs in its own session (`setsid`), so its process group
   stands in for systemd's cgroup: stop means signalling `-pgid`.
-- Paths, timeouts and the default target live in `config.def.h`, which
-  is copied to `config.h` (the suckless convention). The unit structures
-  move to `unit.h`.
+- `config.def.h` holds paths, timeouts and the default target as
+  defines; the unit structures live in `unit.h`.
 - Everything that can be done on the filesystem is done there:
-  `enable`/`disable` create and remove symlinks, so they need no daemon.
-- The kernel is Linux-ABI, so it is developed and tested on Linux first:
-  unprivileged with `-r <root>`, then as PID 1 under
-  `unshare -fp --mount-proc`, then in QEMU on miviex.
+  `enable`/`disable`/`mask` create and remove symlinks without the daemon.
+- Linux-ABI first: tested unprivileged with `-r <root>`, then as PID 1
+  under `unshare -Urfpmu`, then in QEMU on miviex.
 
-## Phase 0: housekeeping
+## Done
 
-- `git init`; it builds with no warnings (`mkdir` needs `<sys/stat.h>`,
-  `putenv` is XSI, `stop_service` does not exist, `simplectl.c` is
-  empty).
-- One code style. miviex uses suckless style (tabs, return type on its
-  own line); simpled should match it.
-- `config.mk` with `PREFIX`/`DESTDIR`, an `install` target, `CC=musl-gcc`
-  and `-static`, header dependencies in the Makefile.
-- Command-line options for testing: `-r` root prefix, `-n` not PID 1
-  (skip mounts and `reboot`).
+- Phase 0: git, suckless layout and style, `config.mk` with
+  `PREFIX`/`DESTDIR`, static musl builds; `-r` root prefix and `-t`
+  target for testing; `make check`.
+- Phase 1: the event loop; reaping in the loop, orphans included; PID 1
+  mounts (`/proc`, `/run`), hostname, `RB_DISABLE_CAD`. Spawning with
+  `setsid`, stdin from `/dev/null`, a clean signal mask, `O_CLOEXEC`
+  everywhere, `initgroups`/`setgid`/`setuid` all checked (a bad
+  `User=` fails the unit, it never runs as root), `execvp` with a built
+  environment. `Restart=no|on-failure|always`, `RestartSec=`,
+  `StartLimitBurst=`/`StartLimitIntervalSec=`.
+- Phase 2: a parser reporting `file:line`, `\` continuations, quoting
+  in `Exec*=`, specifiers `%n %N %p %i %I`; `/etc` over `/lib`;
+  targets, aliases (`default.target`), templates; `Wants`, `Requires`,
+  `After`, `Before`, `Conflicts`, `WantedBy` and `.wants/`/`.requires/`
+  directories; oneshot with `RemainAfterExit=`; dependency failure;
+  ordering cycles reported by their members and broken;
+  `Environment=`, `EnvironmentFile=`, `WorkingDirectory=`, `UMask=`,
+  `StandardInput/Output/Error=`, `TTYPath=`.
+- Phase 3: `ExecStop=` (with `$MAINPID`), `ExecReload=`, `KillSignal=`,
+  `TimeoutStopSec=` then `SIGKILL`; stops in reverse order, stopping a
+  unit stops what requires it; shutdown: all units, `kill(-1)` TERM
+  then KILL, unmount, read-only `/`, `reboot(2)`. SIGINT (Ctrl+Alt+Del)
+  and SIGTERM reboot, SIGUSR2 powers off, SIGHUP reloads.
+- Phase 4, most of it: `simplectl` over request files in
+  `/run/simpled/req` and `SIGUSR1`; `start stop restart reload status
+  is-active reset-failed list daemon-reload poweroff reboot halt`,
+  `enable disable is-enabled mask unmask`; systemctl's exit codes;
+  `poweroff`/`reboot`/`halt` links, `-f` to skip the units.
+- In miviex: `/init` is simpled, built from `ext/simpled`; gettys on
+  tty1 and ttyS0 and `fstab.service` are units. Checked in QEMU: boot in
+  order, a killed getty comes back, `restart`, `poweroff` powers off.
 
-Done when `make` is clean with `-Wall -Wextra -pedantic` and simpled
-runs a test unit directory as an ordinary user on Linux.
+## Phase 4: the rest of simplectl
 
-## Phase 1: a correct PID 1
+- `start`/`stop`/`restart` wait for their job and report its result
+  (today they return once the job is queued, like `--no-block`).
+- `status` for users other than root: needs the socket (phase 6), or
+  state files in `/run/simpled` readable by all.
+- `set-default`, `cat`.
 
-- Event loop: self-pipe, `ppoll`, signals blocked outside it. Reaping
-  happens in the loop, never in the handler, and reaps orphans too.
-- The duties of `miviex/user/init.c`: mount `/proc` and `/run`, set the
-  hostname, `reboot(RB_DISABLE_CAD)`.
-- Spawning: `setsid`, stdin from `/dev/null`, a clean signal mask and
-  dispositions, every inherited fd closed or `O_CLOEXEC`, `initgroups`
-  then `setgid` then `setuid` with every return checked (a failed
-  lookup must fail the unit, not run it as root), an absolute
-  `ExecStart` run with `execve` and an environment built for it.
-- `Restart=no|on-failure|always`, `RestartSec=`, and a start limit so a
-  unit that dies at once does not loop forever.
-- Log lines are unbuffered on the console.
-
-Done when simpled replaces `user/init.c` in the miviex image, boots to
-a login prompt on tty1 and ttyS0 through two units, and killing a getty
-brings it back.
-
-## Phase 2: units and dependencies
-
-- A parser that reports `file:line` for unknown sections and keys,
-  frees what it allocates and rejects over-long lines instead of
-  splitting them.
-- `ExecStart=` split with systemd's quoting rules (double quotes and
-  backslashes; no shell). `%i`, `%n` specifiers.
-- Search path `/etc/simpled/system` then `/lib/simpled/system`; a file
-  in `/etc` masks one of the same name in `/lib`.
-- `.target` units; `default.target` as a symlink.
-- `Wants=`, `Requires=`, `After=`, `Before=`, `Conflicts=`;
-  `[Install] WantedBy=` and `<target>.wants/` directories.
-- Template units: `getty@.service` started as `getty@tty1`.
-- `Type=oneshot` with `RemainAfterExit=`: units ordered after a oneshot
-  start only once it has exited successfully.
-- Start jobs: the set of units pulled in by the target, ordered by
-  `After`/`Before`, cycles reported and broken. A failed `Requires=`
-  fails its dependents.
-- `Environment=`, `EnvironmentFile=`, `WorkingDirectory=`, `UMask=`.
-
-Done when miviex boots `default.target` -> `sysinit.target` (a oneshot
-that mounts `/etc/fstab`, hostname) -> `multi-user.target` with
-`getty@tty1` and `getty@ttyS0`, a dependency cycle is reported without
-hanging the boot, and a unit whose `Requires=` failed is not started.
-
-## Phase 3: stopping and shutdown
-
-- `ExecStop=`, `ExecReload=`, `KillSignal=`, `TimeoutStopSec=`:
-  `SIGTERM` to the process group, `SIGKILL` once the timeout passes.
-- Stopping follows the dependency order backwards; stopping a unit
-  stops what `Requires=` it.
-- Shutdown: stop all units, `kill(-1, SIGTERM)`, wait, `kill(-1,
-  SIGKILL)`, `sync`, unmount (read-only remount for `/`), then
-  `reboot(RB_POWER_OFF | RB_AUTOBOOT | RB_HALT_SYSTEM)`.
-- Ctrl+Alt+Del (`SIGINT` to PID 1) reboots cleanly.
-
-Done when `poweroff` from the shell stops every unit in order and powers
-QEMU off, and a test unit that ignores `SIGTERM` is killed after its
-timeout.
-
-## Phase 4: simplectl
-
-miviex has no Unix domain sockets until its phase 9, so the first
-transport is a spool: `simplectl` writes a request to
-`/run/simpled/req/<pid>.tmp`, renames it to `<pid>`, sends `SIGUSR1` to
-PID 1 and waits for `/run/simpled/rep/<pid>`. The transport sits behind
-one small interface so a socket can replace it later.
-
-- `start`, `stop`, `restart`, `reload`, `status`, `list-units`,
-  `is-active`, `is-enabled`, `daemon-reload`.
-- `enable`, `disable`, `mask`, `unmask`: symlinks only.
-- `poweroff`, `reboot`, `halt`; `rootfs/bin/{poweroff,reboot}` become
-  links to simplectl.
-- systemctl's exit codes (`status` returns 3 for an inactive unit), so
-  scripts written for systemd keep working.
-
-Done when `simplectl status getty@tty1` shows the state, pid, uptime,
-last exit status and the last lines of its log, and `daemon-reload`
-picks up a new unit without a reboot.
+Done when `simplectl start broken.service` returns non-zero and says why.
 
 ## Phase 5: logging
 
-- Each service's stdout and stderr go to a pipe read by PID 1
-  (non-blocking), written with timestamps to
-  `/var/log/simpled/<unit>.log`, one rotation at a size limit.
+- Each service's stdout and stderr go to a pipe read by PID 1 and
+  written with timestamps to `/var/log/simpled/<unit>.log`, one
+  rotation at a size limit. Today the service writes the file itself:
+  no timestamps, no limit. Needs non-blocking pipes on miviex.
 - Lines from before `/var/log` is writable stay in a memory buffer and
-  are flushed later.
-- `StandardOutput=journal|console|null|file:` subset.
+  are flushed later; simpled's own messages go there too.
 - `simplectl log <unit>` (with `-f`).
 
 Done when every boot message and service line is in a file after boot,
@@ -142,8 +89,23 @@ and a service that floods its output cannot stall PID 1.
   logs that survive a reboot.
 - miviex phase 9: `simplectl` over `/run/simpled.sock`; `Type=notify`
   (the `READY=1` subset of `sd_notify`).
-- Optional, only when something needs it: `LimitNOFILE=`-style rlimits,
-  `Type=forking` with `PIDFile=`, simple `.timer` units.
+- Optional, only when something needs it: `ExecStartPost=`,
+  `BindsTo=`, rlimits (`LimitNOFILE=`), `Type=forking` with `PIDFile=`,
+  simple `.timer` units.
+
+## Needed from the miviex kernel
+
+Found while bringing simpled up; simpled works around all of them.
+
+- `ppoll` should apply its signal mask atomically.
+- Pipes should honour `O_NONBLOCK` (phase 5 needs it).
+- init should not get the console as its controlling terminal, as on
+  Linux (or `TIOCNOTTY` should exist): until a getty takes the console,
+  `^C` typed there reaches PID 1 as SIGINT, which means reboot.
+
+Also seen, outside simpled: shush crashes (page fault at 0) on a command
+substitution holding a pipe, `x=$(a | b)`; and the serial console drops
+the first characters of input lines typed into shush.
 
 ## Not planned
 
